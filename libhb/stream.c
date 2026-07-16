@@ -1400,6 +1400,10 @@ static int isIframe( hb_stream_t *stream, const uint8_t *buf, int len )
 
 static int ts_isIframe( hb_stream_t *stream, const uint8_t *buf, int adapt_len )
 {
+    if (adapt_len > 174)
+    {
+        return 0;
+    }
     return isIframe( stream, buf + 13 + adapt_len, 188 - ( 13 + adapt_len ) );
 }
 
@@ -1571,6 +1575,11 @@ static struct pts_pos hb_sample_pts(hb_stream_t *stream, uint64_t fpos)
         if ( buf == NULL )
         {
             hb_log("hb_sample_pts: couldn't find video packet near %"PRIu64, fpos);
+            return pp;
+        }
+        if (adapt_len > 170)
+        {
+            hb_log("hb_sample_pts: PES header exceeds TS packet near %"PRIu64, fpos);
             return pp;
         }
         const uint8_t *pes = buf + 4 + adapt_len;
