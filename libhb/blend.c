@@ -45,57 +45,92 @@ hb_blend_object_t hb_blend =
     .close = hb_blend_close,
 };
 
+static int blend_clip(const hb_buffer_t *dst, const hb_buffer_t *src,
+                      int *x0, int *y0, int *x1, int *y1)
+{
+    const int64_t left = src->f.x;
+    const int64_t top = src->f.y;
+    int64_t start_x = left < 0 ? -left : 0;
+    int64_t start_y = top < 0 ? -top : 0;
+    int64_t end_x = src->f.width;
+    int64_t end_y = src->f.height;
+
+    if (end_x > dst->f.width - left)
+    {
+        end_x = dst->f.width - left;
+    }
+    if (end_y > dst->f.height - top)
+    {
+        end_y = dst->f.height - top;
+    }
+    if (start_x >= end_x || start_y >= end_y)
+    {
+        return 0;
+    }
+
+    *x0 = start_x;
+    *y0 = start_y;
+    *x1 = end_x;
+    *y1 = end_y;
+    return 1;
+}
+
+static int blend_subsample_clip(const hb_buffer_t *dst,
+                                const hb_buffer_t *src,
+                                const hb_blend_private_t *pv,
+                                int *x0, int *y0, int *x1, int *y1)
+{
+    int src_x0, src_y0;
+
+    if (!blend_clip(dst, src, &src_x0, &src_y0, x1, y1))
+    {
+        return 0;
+    }
+
+    *x0 = (src->f.x + src_x0) & ~((1 << pv->wshift) - 1);
+    *y0 = (src->f.y + src_y0) & ~((1 << pv->hshift) - 1);
+    return 1;
+}
+
 static void blend_subsample_8on1x(const hb_blend_private_t *pv, hb_buffer_t *dst, const hb_buffer_t *src, const int shift)
 {
-    int x0, y0, x0c, y0c;
+    int x0, y0;
     int ox, oy;
     int width, height;
     uint8_t *y_in, *u_in, *v_in, *a_in;
     uint16_t *y_out, *u_out, *v_out;
     const unsigned max_val = (256 << shift) - 1;
 
-    const int left = x0 = src->f.x;
-    const int top  = y0 = src->f.y;
+    const int left = src->f.x;
+    const int top  = src->f.y;
 
-    // Coordinates of the first chroma sample affected by the overlay
-    x0c = x0 & ~((1 << pv->wshift) - 1);
-    y0c = y0 & ~((1 << pv->hshift) - 1);
-
-    if (x0c < 0)
+    if (!blend_subsample_clip(dst, src, pv, &x0, &y0, &width, &height))
     {
-        x0c = 0;
+        return;
     }
-    if (y0c < 0)
-    {
-        y0c = 0;
-    }
-
-    width  = (src->f.width  - x0 <= dst->f.width - left) ? src->f.width  : (dst->f.width - left + x0);
-    height = (src->f.height - y0 <= dst->f.height - top) ? src->f.height : (dst->f.height - top + y0);
-
-    // This is setting the pointer outside of the array range if y0c < y0
-    oy = y0c - y0;
 
     unsigned is_chroma_line, res_u, res_v, alpha;
     unsigned accu_a, accu_b, accu_c, coeff;
-    for (int yy = y0c; oy < height; oy = ++yy - y0)
+    for (int yy = y0; yy < top + height; yy++)
     {
+        oy = yy - top;
         y_out = (uint16_t*)(dst->plane[0].data + yy * dst->plane[0].stride);
         u_out = (uint16_t*)(dst->plane[1].data + (yy >> pv->hshift) * dst->plane[1].stride);
         v_out = (uint16_t*)(dst->plane[2].data + (yy >> pv->hshift) * dst->plane[2].stride);
 
-        y_in = src->plane[0].data + oy * src->plane[0].stride;
-        u_in = src->plane[1].data + oy * src->plane[1].stride;
-        v_in = src->plane[2].data + oy * src->plane[2].stride;
-        a_in = src->plane[3].data + oy * src->plane[3].stride;
+        y_in = src->plane[0].data + (oy < 0 ? 0 : oy) * src->plane[0].stride;
+        u_in = src->plane[1].data;
+        v_in = src->plane[2].data;
+        a_in = src->plane[3].data;
 
-        ox = x0c - x0;
+        ox = x0 - left;
         is_chroma_line = yy == (yy & ~((1 << pv->hshift) - 1));
-        for (int xx = x0c; ox < width; ox = ++xx - x0)
+        for (int xx = x0; xx < left + width; xx++)
         {
+            ox = xx - left;
             if (ox >= 0 && oy >= 0)
             {
-                alpha = a_in[ox] << shift;
+                alpha = a_in[ox + oy * src->plane[3].stride] << shift;
                 y_out[xx] = ((uint32_t)y_out[xx] * (max_val - alpha) + ((uint32_t)y_in[ox] << shift) * alpha + (max_val >> 1)) / max_val;
             }
 
@@ -115,12 +150,12 @@ static void blend_subsample_8on1x(const hb_blend_private_t *pv, hb_buffer_t *dst
                         // Chroma sampled area overlap with bitmap
                         if (oxz >= 0 && oyz >= 0 && ox + xz < width && oy + yz < height)
                         {
-                            alpha = (uint32_t)a_in[oxz + yz * src->plane[3].stride] << shift;
+                            alpha = (uint32_t)a_in[oxz + oyz * src->plane[3].stride] << shift;
                             res_u *= (max_val - alpha);
-                            res_u = (res_u + ((uint32_t)(u_in + yz * src->plane[1].stride)[oxz] << shift) * alpha + (max_val>>1)) / max_val;
+                            res_u = (res_u + ((uint32_t)u_in[oxz + oyz * src->plane[1].stride] << shift) * alpha + (max_val>>1)) / max_val;
 
                             res_v *= (max_val - alpha);
-                            res_v = (res_v + ((uint32_t)(v_in + yz * src->plane[2].stride)[oxz] << shift) * alpha + (max_val>>1)) / max_val;
+                            res_v = (res_v + ((uint32_t)v_in[oxz + oyz * src->plane[2].stride] << shift) * alpha + (max_val>>1)) / max_val;
                         }
 
                         // Accumulate
@@ -141,55 +176,43 @@ static void blend_subsample_8on1x(const hb_blend_private_t *pv, hb_buffer_t *dst
 
 static void blend_subsample_8onbi1x(const hb_blend_private_t *pv, hb_buffer_t *dst, const hb_buffer_t *src, const int shift)
 {
-    int x0, y0, x0c, y0c;
+    int x0, y0;
     int ox, oy;
     int width, height;
     uint8_t *y_in, *u_in, *v_in, *a_in;
     uint16_t *y_out, *u_out, *v_out;
     const unsigned max_val = (256 << shift) - 1;
 
-    const int left = x0 = src->f.x;
-    const int top  = y0 = src->f.y;
+    const int left = src->f.x;
+    const int top  = src->f.y;
 
-    // Coordinates of the first chroma sample affected by the overlay
-    x0c = x0 & ~((1 << pv->wshift) - 1);
-    y0c = y0 & ~((1 << pv->hshift) - 1);
-
-    if (x0c < 0)
+    if (!blend_subsample_clip(dst, src, pv, &x0, &y0, &width, &height))
     {
-        x0c = 0;
+        return;
     }
-    if (y0c < 0)
-    {
-        y0c = 0;
-    }
-
-    width  = (src->f.width  - x0 <= dst->f.width - left) ? src->f.width  : (dst->f.width - left + x0);
-    height = (src->f.height - y0 <= dst->f.height - top) ? src->f.height : (dst->f.height - top + y0);
-
-    // This is setting the pointer outside of the array range if y0c < y0
-    oy = y0c - y0;
 
     unsigned is_chroma_line, res_u, res_v, alpha;
     unsigned accu_a, accu_b, accu_c, coeff;
-    for (int yy = y0c; oy < height; oy = ++yy - y0)
+    for (int yy = y0; yy < top + height; yy++)
     {
+        oy = yy - top;
         y_out = (uint16_t*)(dst->plane[0].data + yy * dst->plane[0].stride);
         u_out = (uint16_t*)(dst->plane[1].data + (yy >> pv->hshift) * dst->plane[1].stride);
         v_out = u_out;
 
-        y_in = src->plane[0].data + oy * src->plane[0].stride;
-        u_in = src->plane[1].data + oy * src->plane[1].stride;
-        v_in = src->plane[2].data + oy * src->plane[2].stride;
-        a_in = src->plane[3].data + oy * src->plane[3].stride;
+        y_in = src->plane[0].data + (oy < 0 ? 0 : oy) * src->plane[0].stride;
+        u_in = src->plane[1].data;
+        v_in = src->plane[2].data;
+        a_in = src->plane[3].data;
 
-        ox = x0c - x0;
+        ox = x0 - left;
         is_chroma_line = yy == (yy & ~((1 << pv->hshift) - 1));
-        for (int xx = x0c; ox < width; ox = ++xx - x0)
+        for (int xx = x0; xx < left + width; xx++)
         {
+            ox = xx - left;
             if (ox >= 0 && oy >= 0)
             {
-                alpha = a_in[ox] << shift;
+                alpha = a_in[ox + oy * src->plane[3].stride] << shift;
                 y_out[xx] = ((uint32_t)y_out[xx] * (max_val - alpha) + av_bswap16(y_in[ox]) * alpha + (max_val >> 1)) / max_val;
             }
 
@@ -209,12 +232,12 @@ static void blend_subsample_8onbi1x(const hb_blend_private_t *pv, hb_buffer_t *d
                         // Chroma sampled area overlap with bitmap
                         if (oxz >= 0 && oyz >= 0 && ox + xz < width && oy + yz < height)
                         {
-                            alpha = a_in[oxz + yz*src->plane[3].stride] << shift;
+                            alpha = a_in[oxz + oyz*src->plane[3].stride] << shift;
                             res_u *= (max_val - alpha);
-                            res_u = (res_u + av_bswap16((u_in + yz * src->plane[1].stride)[oxz]) * alpha + (max_val>>1)) / max_val;
+                            res_u = (res_u + av_bswap16(u_in[oxz + oyz * src->plane[1].stride]) * alpha + (max_val>>1)) / max_val;
 
                             res_v *= (max_val - alpha);
-                            res_v = (res_v + av_bswap16((v_in + yz * src->plane[2].stride)[oxz]) * alpha + (max_val>>1)) / max_val;
+                            res_v = (res_v + av_bswap16(v_in[oxz + oyz * src->plane[2].stride]) * alpha + (max_val>>1)) / max_val;
                         }
 
                         // Accumulate
@@ -235,7 +258,7 @@ static void blend_subsample_8onbi1x(const hb_blend_private_t *pv, hb_buffer_t *d
 
 static void blend_subsample_8on8(const hb_blend_private_t *pv, hb_buffer_t *dst, const hb_buffer_t *src, const int shift)
 {
-    int x0, y0, x0c, y0c;
+    int x0, y0;
     int ox, oy;
     int width, height;
     uint8_t *y_in, *y_out;
@@ -243,48 +266,37 @@ static void blend_subsample_8on8(const hb_blend_private_t *pv, hb_buffer_t *dst,
     uint8_t *v_in, *v_out;
     uint8_t *a_in;
 
-    const int left = x0 = src->f.x;
-    const int top  = y0 = src->f.y;
+    const int left = src->f.x;
+    const int top  = src->f.y;
 
-    // Coordinates of the first chroma sample affected by the overlay
-    x0c = x0 & ~((1 << pv->wshift) - 1);
-    y0c = y0 & ~((1 << pv->hshift) - 1);
-
-    if (x0c < 0)
+    if (!blend_subsample_clip(dst, src, pv, &x0, &y0, &width, &height))
     {
-        x0c = 0;
+        return;
     }
-    if (y0c < 0)
-    {
-        y0c = 0;
-    }
-
-    width  = (src->f.width  - x0 <= dst->f.width - left) ? src->f.width  : (dst->f.width - left + x0);
-    height = (src->f.height - y0 <= dst->f.height - top) ? src->f.height : (dst->f.height - top + y0);
-
-    // This is setting the pointer outside of the array range if y0c < y0
-    oy = y0c - y0;
 
     unsigned is_chroma_line, res_u, res_v, alpha;
     unsigned accu_a, accu_b, accu_c, coeff;
-    for (int yy = y0c; oy < height; oy = ++yy - y0)
+    for (int yy = y0; yy < top + height; yy++)
     {
+        oy = yy - top;
         y_out = dst->plane[0].data + yy * dst->plane[0].stride;
         u_out = dst->plane[1].data + (yy >> pv->hshift) * dst->plane[1].stride;
         v_out = dst->plane[2].data + (yy >> pv->hshift) * dst->plane[2].stride;
 
-        y_in = src->plane[0].data + oy * src->plane[0].stride;
-        u_in = src->plane[1].data + oy * src->plane[1].stride;
-        v_in = src->plane[2].data + oy * src->plane[2].stride;
-        a_in = src->plane[3].data + oy * src->plane[3].stride;
+        y_in = src->plane[0].data + (oy < 0 ? 0 : oy) * src->plane[0].stride;
+        u_in = src->plane[1].data;
+        v_in = src->plane[2].data;
+        a_in = src->plane[3].data;
 
-        ox = x0c - x0;
+        ox = x0 - left;
         is_chroma_line = yy == (yy & ~((1 << pv->hshift) - 1));
-        for (int xx = x0c; ox < width; ox = ++xx - x0)
+        for (int xx = x0; xx < left + width; xx++)
         {
+            ox = xx - left;
             if (ox >= 0 && oy >= 0)
             {
-                y_out[xx] = (y_out[xx] * (255 - a_in[ox]) + y_in[ox] * a_in[ox] + 127) / 255;
+                alpha = a_in[ox + oy * src->plane[3].stride];
+                y_out[xx] = (y_out[xx] * (255 - alpha) + y_in[ox] * alpha + 127) / 255;
             }
 
             if (is_chroma_line && xx == (xx & ~((1 << pv->wshift) - 1)))
@@ -303,12 +315,12 @@ static void blend_subsample_8on8(const hb_blend_private_t *pv, hb_buffer_t *dst,
                         // Chroma sampled area overlap with bitmap
                         if (oxz >= 0 && oyz >= 0 && ox + xz < width && oy + yz < height)
                         {
-                            alpha = a_in[oxz + yz*src->plane[3].stride];
+                            alpha = a_in[oxz + oyz*src->plane[3].stride];
                             res_u *= (255 - alpha);
-                            res_u = (res_u + (u_in + yz * src->plane[1].stride)[oxz] * alpha + 127) / 255;
+                            res_u = (res_u + u_in[oxz + oyz * src->plane[1].stride] * alpha + 127) / 255;
 
                             res_v *= (255 - alpha);
-                            res_v = (res_v + (v_in + yz * src->plane[2].stride)[oxz] * alpha + 127) / 255;
+                            res_v = (res_v + v_in[oxz + oyz * src->plane[2].stride] * alpha + 127) / 255;
                         }
 
                         // Accumulate
@@ -329,7 +341,7 @@ static void blend_subsample_8on8(const hb_blend_private_t *pv, hb_buffer_t *dst,
 
 static void blend_subsample_8onbi8(const hb_blend_private_t *pv, hb_buffer_t *dst, const hb_buffer_t *src, const int shift)
 {
-    int x0, y0, x0c, y0c;
+    int x0, y0;
     int ox, oy;
     int width, height;
     uint8_t *y_in, *y_out;
@@ -337,48 +349,37 @@ static void blend_subsample_8onbi8(const hb_blend_private_t *pv, hb_buffer_t *ds
     uint8_t *v_in, *v_out;
     uint8_t *a_in;
 
-    const int left = x0 = src->f.x;
-    const int top = y0 = src->f.y;
+    const int left = src->f.x;
+    const int top = src->f.y;
 
-    // Coordinates of the first chroma sample affected by the overlay
-    x0c = x0 & ~((1 << pv->wshift) - 1);
-    y0c = y0 & ~((1 << pv->hshift) - 1);
-
-    if (x0c < 0)
+    if (!blend_subsample_clip(dst, src, pv, &x0, &y0, &width, &height))
     {
-        x0c = 0;
+        return;
     }
-    if (y0c < 0)
-    {
-        y0c = 0;
-    }
-
-    width  = (src->f.width  - x0 <= dst->f.width - left) ? src->f.width  : (dst->f.width - left + x0);
-    height = (src->f.height - y0 <= dst->f.height - top) ? src->f.height : (dst->f.height - top + y0);
-
-    // This is setting the pointer outside of the array range if y0c < y0
-    oy = y0c - y0;
 
     unsigned is_chroma_line, res_u, res_v, alpha;
     unsigned accu_a, accu_b, accu_c, coeff;
-    for (int yy = y0c; oy < height; oy = ++yy - y0)
+    for (int yy = y0; yy < top + height; yy++)
     {
+        oy = yy - top;
         y_out = dst->plane[0].data + yy * dst->plane[0].stride;
         u_out = dst->plane[1].data + (yy >> pv->hshift) * dst->plane[1].stride;
         v_out = u_out;
 
-        y_in = src->plane[0].data + oy * src->plane[0].stride;
-        u_in = src->plane[1].data + oy * src->plane[1].stride;
-        v_in = src->plane[2].data + oy * src->plane[2].stride;
-        a_in = src->plane[3].data + oy * src->plane[3].stride;
+        y_in = src->plane[0].data + (oy < 0 ? 0 : oy) * src->plane[0].stride;
+        u_in = src->plane[1].data;
+        v_in = src->plane[2].data;
+        a_in = src->plane[3].data;
 
-        ox = x0c - x0;
+        ox = x0 - left;
         is_chroma_line = yy == (yy & ~((1 << pv->hshift) - 1));
-        for (int xx = x0c; ox < width; ox = ++xx - x0)
+        for (int xx = x0; xx < left + width; xx++)
         {
+            ox = xx - left;
             if (ox >= 0 && oy >= 0)
             {
-                y_out[xx] = (y_out[xx] * (255 - a_in[ox]) + y_in[ox] * a_in[ox] + 127) / 255;
+                alpha = a_in[ox + oy * src->plane[3].stride];
+                y_out[xx] = (y_out[xx] * (255 - alpha) + y_in[ox] * alpha + 127) / 255;
             }
 
             if (is_chroma_line && xx == (xx & ~((1 << pv->wshift) - 1)))
@@ -397,12 +398,12 @@ static void blend_subsample_8onbi8(const hb_blend_private_t *pv, hb_buffer_t *ds
                         // Chroma sampled area overlap with bitmap
                         if (oxz >= 0 && oyz >= 0 && ox + xz < width && oy + yz < height)
                         {
-                            alpha = a_in[oxz + yz*src->plane[3].stride];
+                            alpha = a_in[oxz + oyz*src->plane[3].stride];
                             res_u *= (255 - alpha);
-                            res_u = (res_u + (u_in + yz * src->plane[1].stride)[oxz] * alpha + 127) / 255;
+                            res_u = (res_u + u_in[oxz + oyz * src->plane[1].stride] * alpha + 127) / 255;
 
                             res_v *= (255 - alpha);
-                            res_v = (res_v + (v_in + yz * src->plane[2].stride)[oxz] * alpha + 127) / 255;
+                            res_v = (res_v + v_in[oxz + oyz * src->plane[2].stride] * alpha + 127) / 255;
                         }
 
                         // Accumulate
@@ -434,25 +435,9 @@ static void blend8on8(const hb_blend_private_t *pv, hb_buffer_t *dst, const hb_b
     const int left = src->f.x;
     const int top  = src->f.y;
 
-    x0 = y0 = 0;
-    if (left < 0)
+    if (!blend_clip(dst, src, &x0, &y0, &ww, &hh))
     {
-        x0 = -left;
-    }
-    if (top < 0)
-    {
-        y0 = -top;
-    }
-
-    ww = src->f.width;
-    if (src->f.width - x0 > dst->f.width - left)
-    {
-        ww = dst->f.width - left + x0;
-    }
-    hh = src->f.height;
-    if (src->f.height - y0 > dst->f.height - top)
-    {
-        hh = dst->f.height - top + y0;
+        return;
     }
     // Blend luma
     for (int yy = y0; yy < hh; yy++)
@@ -481,6 +466,15 @@ static void blend8on8(const hb_blend_private_t *pv, hb_buffer_t *dst, const hb_b
     if (dst->plane[1].width < dst->plane[0].width)
     {
         wshift = 1;
+    }
+
+    if (left < 0)
+    {
+        x0 = (x0 + (1 << wshift) - 1) & ~((1 << wshift) - 1);
+    }
+    if (top < 0)
+    {
+        y0 = (y0 + (1 << hshift) - 1) & ~((1 << hshift) - 1);
     }
 
     for (int yy = y0 >> hshift; yy < hh >> hshift; yy++)
@@ -527,25 +521,9 @@ static void blend8on1x(const hb_blend_private_t *pv, hb_buffer_t *dst, const hb_
     const int left = src->f.x;
     const int top  = src->f.y;
 
-    x0 = y0 = 0;
-    if (left < 0)
+    if (!blend_clip(dst, src, &x0, &y0, &ww, &hh))
     {
-        x0 = -left;
-    }
-    if (top < 0)
-    {
-        y0 = -top;
-    }
-
-    ww = src->f.width;
-    if (src->f.width - x0 > dst->f.width - left)
-    {
-        ww = dst->f.width - left + x0;
-    }
-    hh = src->f.height;
-    if (src->f.height - y0 > dst->f.height - top)
-    {
-        hh = dst->f.height - top + y0;
+        return;
     }
 
     max = (256 << shift) -1;
@@ -576,6 +554,15 @@ static void blend8on1x(const hb_blend_private_t *pv, hb_buffer_t *dst, const hb_
     if (dst->plane[1].width < dst->plane[0].width)
     {
         wshift = 1;
+    }
+
+    if (left < 0)
+    {
+        x0 = (x0 + (1 << wshift) - 1) & ~((1 << wshift) - 1);
+    }
+    if (top < 0)
+    {
+        y0 = (y0 + (1 << hshift) - 1) & ~((1 << hshift) - 1);
     }
 
     for (int yy = y0 >> hshift; yy < hh >> hshift; yy++)
@@ -615,25 +602,9 @@ static void blend8onbi8(const hb_blend_private_t *pv, hb_buffer_t *dst, const hb
     const int left = src->f.x;
     const int top  = src->f.y;
 
-    x0 = y0 = 0;
-    if (left < 0)
+    if (!blend_clip(dst, src, &x0, &y0, &ww, &hh))
     {
-        x0 = -left;
-    }
-    if (top < 0)
-    {
-        y0 = -top;
-    }
-
-    ww = src->f.width;
-    if (src->f.width - x0 > dst->f.width - left)
-    {
-        ww = dst->f.width - left + x0;
-    }
-    hh = src->f.height;
-    if (src->f.height - y0 > dst->f.height - top)
-    {
-        hh = dst->f.height - top + y0;
+        return;
     }
 
     // Blend luma
@@ -663,6 +634,15 @@ static void blend8onbi8(const hb_blend_private_t *pv, hb_buffer_t *dst, const hb
     if (dst->plane[1].width < dst->plane[0].width)
     {
         wshift = 1;
+    }
+
+    if (left < 0)
+    {
+        x0 = (x0 + (1 << wshift) - 1) & ~((1 << wshift) - 1);
+    }
+    if (top < 0)
+    {
+        y0 = (y0 + (1 << hshift) - 1) & ~((1 << hshift) - 1);
     }
 
     for (int yy = y0 >> hshift; yy < hh >> hshift; yy++)
@@ -709,25 +689,9 @@ static void blend8onbi1x(const hb_blend_private_t *pv, hb_buffer_t *dst, const h
     const int left = src->f.x;
     const int top  = src->f.y;
 
-    x0 = y0 = 0;
-    if (left < 0)
+    if (!blend_clip(dst, src, &x0, &y0, &ww, &hh))
     {
-        x0 = -left;
-    }
-    if (top < 0)
-    {
-        y0 = -top;
-    }
-
-    ww = src->f.width;
-    if (src->f.width - x0 > dst->f.width - left)
-    {
-        ww = dst->f.width - left + x0;
-    }
-    hh = src->f.height;
-    if (src->f.height - y0 > dst->f.height - top)
-    {
-        hh = dst->f.height - top + y0;
+        return;
     }
 
     max = (256 << shift) -1;
@@ -758,6 +722,15 @@ static void blend8onbi1x(const hb_blend_private_t *pv, hb_buffer_t *dst, const h
     if (dst->plane[1].width < dst->plane[0].width)
     {
         wshift = 1;
+    }
+
+    if (left < 0)
+    {
+        x0 = (x0 + (1 << wshift) - 1) & ~((1 << wshift) - 1);
+    }
+    if (top < 0)
+    {
+        y0 = (y0 + (1 << hshift) - 1) & ~((1 << hshift) - 1);
     }
 
     for (int yy = y0 >> hshift; yy < hh >> hshift; yy++)
